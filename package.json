@@ -1,0 +1,46 @@
+{
+  "name": "konveksi-ops",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "sync:assets": "npm run build && rm -rf app/src/main/assets/public && mkdir -p app/src/main/assets/public && cp -r dist/* app/src/main/assets/public/",
+    "preview": "vite preview",
+    "lint": "eslint .",
+    "test:unit": "vitest run tests/unit",
+    "test:rules": "firebase emulators:exec --only firestore \"vitest run tests/rules\"",
+    "test:integration": "VITE_USE_EMULATORS=true firebase emulators:exec --only auth,firestore \"vitest run tests/integration --reporter=verbose\"",
+    "test": "vitest run tests/unit"
+  },
+  "dependencies": {
+    "@capacitor/app": "^6.0.2",
+    "@capacitor/core": "^6.2.0",
+    "firebase": "^11.3.1",
+    "jspdf": "^2.5.2",
+    "jspdf-autotable": "^3.8.4",
+    "lucide-react": "^0.475.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "read-excel-file": "^9.3.20"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^6.2.0",
+    "@eslint/js": "^9.20.0",
+    "@firebase/rules-unit-testing": "^4.0.1",
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "autoprefixer": "^10.4.20",
+    "eslint": "^9.20.0",
+    "eslint-plugin-react-hooks": "^5.1.0",
+    "eslint-plugin-react-refresh": "^0.4.19",
+    "globals": "^15.15.0",
+    "postcss": "^8.5.1",
+    "tailwindcss": "^3.4.17",
+    "typescript": "~5.7.2",
+    "typescript-eslint": "^8.24.0",
+    "vitest": "^3.0.6"
+  }
+}

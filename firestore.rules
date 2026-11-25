@@ -1,0 +1,855 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // --- Helper Autentikasi & RBAC (Hanya 'owner' dan 'admin') ---
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function userDocPath() {
+      return /databases/$(database)/documents/users/$(request.auth.uid);
+    }
+
+    function hasActiveUser() {
+      return isSignedIn()
+        && exists(userDocPath())
+        && get(userDocPath()).data.active == true
+        && get(userDocPath()).data.role in ['owner', 'admin'];
+    }
+
+    function userRole() {
+      return get(userDocPath()).data.role;
+    }
+
+    function isOwner() {
+      return hasActiveUser() && userRole() == 'owner';
+    }
+
+    function isOwnerOrAdmin() {
+      return hasActiveUser() && userRole() in ['owner', 'admin'];
+    }
+
+    // --- Helper Validasi Data & Periode ---
+    function isDateStr(d) {
+      return d is string && d.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$');
+    }
+
+    function isPeriodId(p) {
+      return p is string && p.matches('^[0-9]{4}-[0-9]{2}$');
+    }
+
+    function isPeriodOpen(tanggal) {
+      return isDateStr(tanggal) && (
+        !exists(/databases/$(database)/documents/periods/$(tanggal[0:7]))
+        || get(/databases/$(database)/documents/periods/$(tanggal[0:7])).data.closed == false
+      );
+    }
+
+    function hasNoCostFields(data) {
+      return !('hargaModal' in data)
+        && !('hargaBeli' in data)
+        && !('hpp' in data)
+        && !('margin' in data)
+        && !('unitCost' in data)
+        && !('upahCmt' in data)
+        && !('biayaProduksi' in data);
+    }
+
+    function validAuditMeta(data) {
+      return data.createdBy == request.auth.uid
+        && data.createdAt == request.time;
+    }
+
+    function validStr(val, maxLen) {
+      return val is string && val.size() > 0 && val.size() <= maxLen;
+    }
+
+    function validOptStr(data, key, maxLen) {
+      return !data.keys().hasAny([key])
+        || (data[key] is string && data[key].size() <= maxLen);
+    }
+
+    function validUserPayload(data) {
+      return data.keys().hasAll(['nama', 'email', 'role', 'active'])
+        && data.nama is string && data.nama.size() >= 2 && data.nama.size() <= 100
+        && data.email is string && data.email.size() >= 3
+        && data.role in ['owner', 'admin']
+        && data.active is bool;
+    }
+
+    // --- 1. USERS (Kelola User strictly OWNER-only; Admin hanya boleh get profil sendiri) ---
+    match /users/{uid} {
+      allow get: if isSignedIn() && (request.auth.uid == uid || isOwner());
+      allow list: if isOwner();
+      allow create: if isOwner() && validUserPayload(request.resource.data);
+      allow update: if isOwner()
+        && validUserPayload(request.resource.data)
+        && (
+          uid != request.auth.uid
+          || (
+            request.resource.data.role == resource.data.role
+            && request.resource.data.active == resource.data.active
+          )
+        );
+      allow delete: if false;
+    }
+
+    // --- 2. MASTER DATA ---
+    function validMaterialShape(data) {
+      return data.keys().hasOnly([
+          'kode', 'nama', 'kategori', 'satuan', 'satuanBeli', 'satuanPakai',
+          'konversi', 'minStock', 'active', 'createdBy', 'createdAt', 'updatedAt'
+        ])
+        && hasNoCostFields(data)
+        && validStr(data.kode, 500)
+        && validStr(data.nama, 500)
+        && data.kategori in ['kain', 'benang', 'kancing', 'resleting', 'hangtag', 'kemasan', 'lainnya']
+        && validStr(data.satuan, 100)
+        && (!data.keys().hasAny(['satuanBeli']) || data.satuanBeli in ['roll', 'pak', 'bungkus', 'meter', 'kg', 'lusin'])
+        && (!data.keys().hasAny(['satuanPakai']) || data.satuanPakai in ['cm', 'pcs'])
+        && (!data.keys().hasAny(['konversi']) || data.konversi == null || (data.konversi is int && data.konversi > 0))
+        && data.minStock is int && data.minStock >= 0
+        && data.active is bool;
+    }
+
+    match /materials/{id} {
+      allow read: if isOwnerOrAdmin();
+      allow create: if isOwnerOrAdmin()
+        && validMaterialShape(request.resource.data)
+        && !request.resource.data.keys().hasAny(['updatedAt'])
+        && validAuditMeta(request.resource.data);
+      allow update: if isOwnerOrAdmin()
+        && validMaterialShape(request.resource.data)
+        && request.resource.data.createdBy == resource.data.createdBy
+        && (!request.resource.data.keys().hasAny(['updatedAt']) || request.resource.data.updatedAt == request.time);
+      allow delete: if false;
+    }
+
+    function validProductShape(data) {
+      return data.keys().hasOnly([
+          'sku', 'nama', 'model', 'warna', 'ukuran', 'satuan', 'minStock', 'hargaJual',
+          'hppPerPcs', 'active', 'createdBy', 'createdAt', 'updatedAt'
+        ])
+        && validStr(data.sku, 500)
+        && validStr(data.nama, 500)
+        && data.model is string && data.model.size() <= 500
+        && data.warna is string && data.warna.size() <= 500
+        && data.ukuran is string && data.ukuran.size() <= 500
+        && validStr(data.satuan, 100)
+        && data.minStock is int && data.minStock >= 0
+        && data.hargaJual is int && data.hargaJual >= 0
+        && (!data.keys().hasAny(['hppPerPcs']) || (data.hppPerPcs is int && data.hppPerPcs >= 0))
+        && data.active is bool;
+    }
+
+    match /products/{id} {
+      allow read: if isOwnerOrAdmin();
+      allow create: if isOwnerOrAdmin()
+        && validProductShape(request.resource.data)
+        && !request.resource.data.keys().hasAny(['updatedAt'])
+        && validAuditMeta(request.resource.data);
+      allow update: if isOwnerOrAdmin()
+        && validProductShape(request.resource.data)
+        && request.resource.data.createdBy == resource.data.createdBy
+        && (!request.resource.data.keys().hasAny(['updatedAt']) || request.resource.data.updatedAt == request.time);
+      allow delete: if false;
+    }
+
+    function validSupplierShape(data) {
+      return data.keys().hasOnly([
+          'nama', 'telepon', 'alamat', 'catatan', 'active', 'createdBy', 'createdAt'
+        ])
+        && validStr(data.nama, 500)
+        && validOptStr(data, 'telepon', 500)
+        && validOptStr(data, 'alamat', 500)
+        && validOptStr(data, 'catatan', 500)
+        && data.active is bool;
+    }
+
+    match /suppliers/{id} {
+      allow read: if isOwnerOrAdmin();
+      allow create: if isOwnerOrAdmin()
+        && validSupplierShape(request.resource.data)
+        && validAuditMeta(request.resource.data);
+      allow update: if isOwnerOrAdmin()
+        && validSupplierShape(request.resource.data)
+        && request.resource.data.createdBy == resource.data.createdBy;
+      allow delete: if false;
+    }
+
+    function validCustomerShape(data) {
+      return data.keys().hasOnly([
+          'nama', 'tipe', 'telepon', 'alamat', 'active', 'createdBy', 'createdAt'
+        ])
+        && validStr(data.nama, 500)
+        && validStr(data.tipe, 100)
+        && validOptStr(data, 'telepon', 500)
+        && validOptStr(data, 'alamat', 500)
+        && data.active is bool;
+    }
+
+    match /customers/{id} {
+      allow read: if isOwnerOrAdmin();
+      allow create: if isOwnerOrAdmin()
+        && validCustomerShape(request.resource.data)
+        && validAuditMeta(request.resource.data);
+      allow update: if isOwnerOrAdmin()
+        && validCustomerShape(request.resource.data)
+        && request.resource.data.createdBy == resource.data.createdBy;
+      allow delete: if false;
+    }
+
+    // --- A. SALDO KAS/BANK (Wajib pasangan payment atau audit_logs dalam transaksi sama) ---
+    function isPairedAccountPayment(accountId) {
+      return request.resource.data.keys().hasAny(['lastPaymentId'])
+        && validStr(request.resource.data.lastPaymentId, 500)
+        && !exists(/databases/$(database)/documents/payments/$(request.resource.data.lastPaymentId))
+        && existsAfter(/databases/$(database)/documents/payments/$(request.resource.data.lastPaymentId))
+        && getAfter(/databases/$(database)/documents/payments/$(request.resource.data.lastPaymentId)).data.accountId == accountId
+        && getAfter(/databases/$(database)/documents/payments/$(request.resource.data.lastPaymentId)).data.amount is int
+        && getAfter(/databases/$(database)/documents/payments/$(request.resource.data.lastPaymentId)).data.amount > 0
+        && request.resource.data.saldoBerjalan
+           == resource.data.saldoBerjalan
+              + getAfter(/databases/$(database)/documents/payments/$(request.resource.data.lastPaymentId)).data.amount;
+    }
+
+    function isAuditedAccountBalanceChange(accountId) {
+      return request.resource.data.keys().hasAny(['lastAuditLogId'])
+        && validStr(request.resource.data.lastAuditLogId, 500)
+        && !exists(/databases/$(database)/documents/audit_logs/$(request.resource.data.lastAuditLogId))
+        && existsAfter(/databases/$(database)/documents/audit_logs/$(request.resource.data.lastAuditLogId))
+        && getAfter(/databases/$(database)/documents/audit_logs/$(request.resource.data.lastAuditLogId)).data.uid == request.auth.uid
+        && getAfter(/databases/$(database)/documents/audit_logs/$(request.resource.data.lastAuditLogId)).data.createdBy == request.auth.uid
+        && getAfter(/databases/$(database)/documents/audit_logs/$(request.resource.data.lastAuditLogId)).data.targetCollection == 'accounts'
+        && getAfter(/databases/$(database)/documents/audit_logs/$(request.resource.data.lastAuditLogId)).data.targetId == accountId
+        && getAfter(/databases/$(database)/documents/audit_logs/$(request.resource.data.lastAuditLogId)).data.createdAt == request.time;
+    }
+
+    function validAccountShape(data) {
+      return data.keys().hasOnly([
+          'nama', 'tipe', 'nomorRekening', 'saldoAwal', 'saldoBerjalan',
+          'active', 'lastPaymentId', 'lastAuditLogId', 'createdBy', 'createdByName', 'createdAt'
+        ])
+        && validStr(data.nama, 500)
+        && validOptStr(data, 'nomorRekening', 500)
+        && validOptStr(data, 'createdByName', 500);
+    }
+
+    match /accounts/{id} {
+      allow read: if isOwnerOrAdmin();
+      allow create: if isOwnerOrAdmin()
+        && validAccountShape(request.resource.data)
+        && request.resource.data.tipe in ['kas', 'bank']
+        && request.resource.data.saldoAwal is int
+        && request.resource.data.saldoBerjalan is int
+        && request.resource.data.saldoBerjalan == request.resource.data.saldoAwal
+        && request.resource.data.active is bool
+        && validAuditMeta(request.resource.data);
+      allow update: if isOwnerOrAdmin()
+        && validAccountShape(request.resource.data)
+        && request.resource.data.saldoBerjalan is int
+        && request.resource.data.active is bool
+        && request.resource.data.createdBy == resource.data.createdBy
+        && (
+          request.resource.data.saldoBerjalan == resource.data.saldoBerjalan
+          || isPairedAccountPayment(id)
+          || isAuditedAccountBalanceChange(id)
+        );
+      allow delete: if false;
+    }
+
+    // --- 3. PERSEDIAAN: STOCK LEDGER (APPEND-ONLY) & STOCK BALANCES ---
+    // Aturan minus: Hanya itemType 'product' yang boleh minus (Owner & Admin); 'material' & 'wip' DILARANG minus.
+    function allowedLedgerRoleAndSign(jenis, qty) {
+      return isOwnerOrAdmin() && (
+        (jenis == 'penerimaan' && qty > 0)
+        || (jenis == 'pemakaian_produksi' && qty < 0)
+        || (jenis == 'wip_masuk' && qty > 0)
+        || (jenis == 'wip_keluar' && qty < 0)
+        || (jenis == 'hasil_produksi' && qty > 0)
+        || (jenis == 'penjualan' && qty < 0)
+        || (jenis == 'retur' && qty > 0)
+        || (jenis in ['opname_koreksi', 'reversal'] && qty != 0)
+      );
+    }
+
+    function validLedgerItemType(jenis, itemType) {
+      return (
+        (jenis in ['penerimaan', 'pemakaian_produksi'] && itemType == 'material')
+        || (jenis in ['wip_masuk', 'wip_keluar'] && itemType == 'wip')
+        || (jenis in ['hasil_produksi', 'penjualan', 'retur'] && itemType == 'product')
+        || (jenis in ['opname_koreksi', 'reversal'] && itemType in ['material', 'product', 'wip'])
+      );
+    }
+
+    match /stock_ledger/{ledgerId} {
+      allow read: if isOwnerOrAdmin();
+      allow create: if isOwnerOrAdmin()
+        && hasNoCostFields(request.resource.data)
+        && request.resource.data.keys().hasOnly([
+          'itemId', 'itemType', 'jenis', 'qty', 'tanggal', 'refType', 'refId',
+          'catatan', 'balance_before', 'balance_after', 'createdBy', 'createdByName', 'createdAt'
+        ])
+        && validAuditMeta(request.resource.data)
+        && validStr(request.resource.data.itemId, 500)
+        && request.resource.data.itemType in ['material', 'product', 'wip']
+        && request.resource.data.jenis is string
+        && validLedgerItemType(request.resource.data.jenis, request.resource.data.itemType)
+        && request.resource.data.qty is int && request.resource.data.qty != 0
+        && request.resource.data.balance_before is int
+        && request.resource.data.balance_after is int
+        && request.resource.data.balance_after == request.resource.data.balance_before + request.resource.data.qty
+        && (request.resource.data.balance_after >= 0 || request.resource.data.itemType == 'product')
+        && validStr(request.resource.data.refType, 500)
+        && validStr(request.resource.data.refId, 500)
+        && validOptStr(request.resource.data, 'catatan', 500)
+        && validOptStr(request.resource.data, 'createdByName', 500)
+        && isPeriodOpen(request.resource.data.tanggal)
+        && allowedLedgerRoleAndSign(request.resource.data.jenis, request.resource.data.qty)
+        && existsAfter(/databases/$(database)/documents/stock_balances/$(request.resource.data.itemId))
+        && getAfter(/databases/$(database)/documents/stock_balances/$(request.resource.data.itemId)).data.lastLedgerId == ledgerId
+        && getAfter(/databases/$(database)/documents/stock_balances/$(request.resource.data.itemId)).data.qty == request.resource.data.balance_after;
+      allow update, delete: if false;
+    }
+
+    match /stock_balances/{itemId} {
+      allow read: if isOwnerOrAdmin();
+      allow create, update: if isOwnerOrAdmin()
+        && request.resource.data.keys().hasOnly(['itemId', 'itemType', 'qty', 'lastLedgerId', 'updatedAt'])
+        && validStr(request.resource.data.itemId, 500)
+        && request.resource.data.itemId == itemId
+        && request.resource.data.itemType in ['material', 'product', 'wip']
+        && request.resource.data.qty is int
+        && (request.resource.data.qty >= 0 || request.resource.data.itemType == 'product')
+        && validStr(request.resource.data.lastLedgerId, 500)
+        && (!request.resource.data.keys().hasAny(['updatedAt']) || request.resource.data.updatedAt == request.time)
+        && !exists(/databases/$(database)/documents/stock_ledger/$(request.resource.data.lastLedgerId))
+        && existsAfter(/databases/$(database)/documents/stock_ledger/$(request.resource.data.lastLedgerId))
+        && getAfter(/databases/$(database)/documents/stock_ledger/$(request.resource.data.lastLedgerId)).data.itemId == itemId
+        && getAfter(/databases/$(database)/documents/stock_ledger/$(request.resource.data.lastLedgerId)).data.balance_after == request.resource.data.qty
+        && getAfter(/databases/$(database)/documents/stock_ledger/$(request.resource.data.lastLedgerId)).data.balance_before == (resource == null ? 0 : resource.data.qty)
+        && getAfter(/databases/$(database)/documents/stock_ledger/$(request.resource.data.lastLedgerId)).data.balance_after
+           == getAfter(/databases/$(database)/documents/stock_ledger/$(request.resource.data.lastLedgerId)).data.balance_before
+              + getAfter(/databases/$(database)/documents/stock_ledger/$(request.resource.data.lastLedgerId)).data.qty;
+      allow delete: if false;
+    }
+
+    function validOpnameShape(data) {
+      return data.keys().hasOnly([
+          'itemId', 'itemType', 'systemQty', 'physicalQty', 'diffQty', 'alasan',
+          'tanggal', 'status', 'createdBy', 'createdByName', 'createdAt',
+          'approvedBy', 'approvedAt'
+        ])
+        && validStr(data.itemId, 500)
+        && data.itemType in ['material', 'product']
+        && data.systemQty is int
+        && data.physicalQty is int && data.physicalQty >= 0
+        && data.diffQty is int
+        && data.diffQty == data.physicalQty - data.systemQty
+        && validOptStr(data, 'alasan', 500)
+        && validOptStr(data, 'createdByName', 500)
+        && validOptStr(data, 'approvedBy', 500);
+    }
+
+    match /opname_requests/{id} {
+      allow read: if isOwnerOrAdmin();
+      allow create: if isOwnerOrAdmin()
+        && validOpnameShape(request.resource.data)
+        && !request.resource.data.keys().hasAny(['approvedBy', 'approvedAt'])
+        && request.resource.data.status == 'pending'
+        && isPeriodOpen(request.resource.data.tanggal)
+        && validAuditMeta(request.resource.data);
+      allow update: if isOwnerOrAdmin()
+        && validOpnameShape(request.resource.data)
+        && resource.data.status == 'pending'
+        && request.resource.data.status in ['approved', 'rejected']
+        && request.resource.data.itemId == resource.data.itemId
+        && request.resource.data.itemType == resource.data.itemType
+        && request.resource.data.systemQty == resource.data.systemQty
+        && request.resource.data.physicalQty == resource.data.physicalQty
+        && request.resource.data.diffQty == resource.data.diffQty
+        && request.resource.data.tanggal == resource.data.tanggal
+        && request.resource.data.approvedBy == request.auth.uid
+        && request.resource.data.approvedAt == request.time
+        && request.resource.data.createdBy == resource.data.createdBy;
+      allow delete: if false;
+    }
+
+    // --- 4. PRODUKSI: WORK ORDER, RESEP (bom_items: bahan + komponen biaya), STAGE LOGS ---
+    function validBomShape(data) {
+      return data.keys().hasOnly([
+          'productId', 'jenis', 'materialId', 'qtyPerPcs',
+          'costCategory', 'label', 'amountPerPcs',
+          'active', 'createdBy', 'createdAt'
+        ])
+        && validStr(data.productId, 500)
+        && data.active is bool
+        && (
+          (
+            (!data.keys().hasAny(['jenis']) || data.jenis == 'material')
+            && validStr(data.materialId, 500)
+            && data.qtyPerPcs is int && data.qtyPerPcs > 0
+          ) || (
+            data.jenis == 'cost'
+            && data.costCategory in ['jahit_cutting', 'sablon', 'packing', 'lainnya']
+            && validStr(data.label, 500)
+            && data.amountPerPcs is int && data.amountPerPcs >= 0
+          )
+        );
+    }
+
+    match /bom_items/{id} {
+      allow read: if isOwnerOrAdmin();
+      allow create: if isOwnerOrAdmin()
+        && validBomShape(request.resource.data)
+        && validAuditMeta(request.resource.data);
+      allow update: if isOwnerOrAdmin()
+        && validBomShape(request.resource.data)
+        && request.resource.data.createdBy == resource.data.createdBy;
+      allow delete: if false;
+    }
+
+    function validWorkOrderShape(data) {
+      return data.keys().hasOnly([
+          'woNumber', 'productId', 'targetQty', 'completedQty', 'wipQty', 'rejectedQty',
+          'cutCompleted', 'cutMaterialIds', 'hppPerPcsSnapshot',
+          'currentStage', 'status', 'tanggal', 'catatan',
+          'createdBy', 'createdByName', 'createdAt', 'updatedAt', 'completedAt'
+        ])
+        && validStr(data.woNumber, 500)
+        && validStr(data.productId, 500)
+        && data.targetQty is int && data.targetQty > 0
+        && (!data.keys().hasAny(['completedQty']) || (data.completedQty is int && data.completedQty >= 0))
+        && (!data.keys().hasAny(['wipQty']) || (data.wipQty is int && data.wipQty >= 0))
+        && (!data.keys().hasAny(['rejectedQty']) || (data.rejectedQty is int && data.rejectedQty >= 0))
+        && (!data.keys().hasAny(['cutCompleted']) || data.cutCompleted is bool)
+        && (!data.keys().hasAny(['cutMaterialIds']) || (data.cutMaterialIds is list && data.cutMaterialIds.size() <= 100))
+        && (!data.keys().hasAny(['hppPerPcsSnapshot']) || (data.hppPerPcsSnapshot is int && data.hppPerPcsSnapshot >= 0))
+        && data.currentStage in ['potong', 'setoran', 'reject', 'cutting', 'sewing', 'qc', 'packing', 'completed']
+        && data.status in ['draft', 'in_progress', 'completed', 'cancelled']
+        && isDateStr(data.tanggal)
+        && validOptStr(data, 'catatan', 500)
+        && validOptStr(data, 'createdByName', 500);
+    }
+
+    match /work_orders/{woId} {
+      allow read: if isOwnerOrAdmin();
+      allow create: if isOwnerOrAdmin()
+        && validWorkOrderShape(request.resource.data)
+        && isPeriodOpen(request.resource.data.tanggal)
+        && validAuditMeta(request.resource.data);
+      allow update: if isOwnerOrAdmin()
+        && validWorkOrderShape(request.resource.data)
+        && request.resource.data.createdBy == resource.data.createdBy
+        && isPeriodOpen(resource.data.tanggal)
+        && (!request.resource.data.keys().hasAny(['updatedAt']) || request.resource.data.updatedAt == request.time);
+      allow delete: if false;
+
+      match /stage_logs/{logId} {
+        allow read: if isOwnerOrAdmin();
+        allow create: if isOwnerOrAdmin()
+          && hasNoCostFields(request.resource.data)
+          && request.resource.data.keys().hasOnly([
+            'stage', 'inputQty', 'goodQty', 'rejectQty', 'reworkQty', 'rejectReason',
+            'tanggal', 'createdBy', 'createdByName', 'createdAt'
+          ])
+          && request.resource.data.stage in ['potong', 'setoran', 'reject', 'cutting', 'sewing', 'qc', 'packing']
+          && request.resource.data.inputQty is int && request.resource.data.inputQty >= 0
+          && request.resource.data.goodQty is int && request.resource.data.goodQty >= 0
+          && request.resource.data.rejectQty is int && request.resource.data.rejectQty >= 0
+          && request.resource.data.reworkQty is int && request.resource.data.reworkQty >= 0
+          && request.resource.data.goodQty + request.resource.data.rejectQty <= request.resource.data.inputQty
+          && validOptStr(request.resource.data, 'rejectReason', 500)
+          && validOptStr(request.resource.data, 'createdByName', 500)
+          && isPeriodOpen(request.resource.data.tanggal)
+          && validAuditMeta(request.resource.data);
+        allow update, delete: if false;
+      }
+    }
+
+    match /{path=**}/stage_logs/{logId} {
+      allow read: if isOwnerOrAdmin();
+    }
+
+    // --- 5. PENJUALAN MARKETPLACE: CHANNELS, SALES ORDERS, PAYMENTS, RETURNS, PAYOUTS ---
+    // CATATAN KRITIS: JANGAN menambah pemanggilan get()/getAfter()/exists()/existsAfter()
+    // di jalur SO 6 SKU (E.10) agar kuota 20 panggilan transaksi tetap terjaga.
+    function validSalesOrderShape(data) {
+      return data.keys().hasOnly([
+          'soNumber', 'customerId', 'customerName', 'channel', 'noPesanan',
+          'totalAmount', 'biayaAdmin', 'komisiAffiliate', 'potonganLain', 'penerimaanBersih',
+          'paidAmount', 'paymentStatus', 'shippingStatus', 'status', 'importKey',
+          'tanggal', 'catatan', 'createdBy', 'createdByName', 'createdAt'
+        ])
+        && validStr(data.soNumber, 500)
+        && data.customerId is string && data.customerId.size() <= 500
+        && validOptStr(data, 'customerName', 500)
+        && validStr(data.channel, 100)
+        && validOptStr(data, 'noPesanan', 200)
+        && validOptStr(data, 'importKey', 300)
+        && validOptStr(data, 'catatan', 500)
+        && validOptStr(data, 'createdByName', 500)
+        && (!data.keys().hasAny(['biayaAdmin']) || (data.biayaAdmin is int && data.biayaAdmin >= 0))
+        && (!data.keys().hasAny(['komisiAffiliate']) || (data.komisiAffiliate is int && data.komisiAffiliate >= 0))
+        && (!data.keys().hasAny(['potonganLain']) || (data.potonganLain is int && data.potonganLain >= 0))
+        && (!data.keys().hasAny(['penerimaanBersih']) || (data.penerimaanBersih is int && data.penerimaanBersih >= 0));
+    }
+
+    match /sales_orders/{soId} {
+      allow read: if isOwnerOrAdmin();
+      allow create: if isOwnerOrAdmin()
+        && hasNoCostFields(request.resource.data)
+        && validSalesOrderShape(request.resource.data)
+        && request.resource.data.totalAmount is int && request.resource.data.totalAmount >= 0
+        && request.resource.data.paidAmount is int && request.resource.data.paidAmount >= 0
+        && request.resource.data.paidAmount <= request.resource.data.totalAmount
+        && request.resource.data.paymentStatus in ['unpaid', 'dp', 'paid']
+        && request.resource.data.shippingStatus in ['pending', 'packed', 'shipped', 'delivered']
+        && request.resource.data.status in ['active', 'void']
+        && isPeriodOpen(request.resource.data.tanggal)
+        && validAuditMeta(request.resource.data);
+      allow update: if isOwnerOrAdmin()
+        && hasNoCostFields(request.resource.data)
+        && validSalesOrderShape(request.resource.data)
+        && request.resource.data.createdBy == resource.data.createdBy
+        && request.resource.data.paidAmount is int
+        && request.resource.data.paidAmount <= request.resource.data.totalAmount
+        && request.resource.data.paymentStatus in ['unpaid', 'dp', 'paid']
+        && request.resource.data.shippingStatus in ['pending', 'packed', 'shipped', 'delivered']
+        && request.resource.data.status in ['active', 'void'];
+      allow delete: if false;
+
+      match /items/{lineId} {
+        allow read: if isOwnerOrAdmin();
+        allow create: if isOwnerOrAdmin()
+          && hasNoCostFields(request.resource.data)
+          && request.resource.data.keys().hasOnly([
+            'productId', 'productName', 'sku', 'qty', 'unitPrice', 'subtotal'
+          ])
+          && validStr(request.resource.data.productId, 500)
+          && validOptStr(request.resource.data, 'productName', 500)
+          && validOptStr(request.resource.data, 'sku', 500)
+          && request.resource.data.qty is int && request.resource.data.qty > 0
+          && request.resource.data.unitPrice is int && request.resource.data.unitPrice >= 0
+          && request.resource.data.subtotal == request.resource.data.qty * request.resource.data.unitPrice;
+        allow update, delete: if false;
+      }
+    }
+
+    match /payments/{id} {
+      allow read: if isOwnerOrAdmin();
+      allow create: if isOwnerOrAdmin()
+        && request.resource.data.keys().hasOnly([
+          'soId', 'soNumber', 'accountId', 'accountName', 'amount', 'tanggal',
+          'metode', 'catatan', 'createdBy', 'createdByName', 'createdAt'
+        ])
+        && validStr(request.resource.data.soId, 500)
+        && validOptStr(request.resource.data, 'soNumber', 500)
+        && validStr(request.resource.data.accountId, 500)
+        && validOptStr(request.resource.data, 'accountName', 500)
+        && validOptStr(request.resource.data, 'metode', 500)
+        && validOptStr(request.resource.data, 'catatan', 500)
+        && validOptStr(request.resource.data, 'createdByName', 500)
+        && request.resource.data.amount is int && request.resource.data.amount > 0
+        && isPeriodOpen(request.resource.data.tanggal)
+        && validAuditMeta(request.resource.data)
+        && exists(/databases/$(database)/documents/accounts/$(request.resource.data.accountId))
+        && existsAfter(/databases/$(database)/documents/accounts/$(request.resource.data.accountId))
+        && getAfter(/databases/$(database)/documents/accounts/$(request.resource.data.accountId)).data.lastPaymentId == id
+        && getAfter(/databases/$(database)/documents/accounts/$(request.resource.data.accountId)).data.saldoBerjalan
+           == get(/databases/$(database)/documents/accounts/$(request.resource.data.accountId)).data.saldoBerjalan
+              + request.resource.data.amount;
+      allow update, delete: if false;
+    }
+
+    match /sales_returns/{id} {
+      allow read: if isOwnerOrAdmin();
+      allow create: if isOwnerOrAdmin()
+        && request.resource.data.keys().hasOnly([
+          'soId', 'soNumber', 'productId', 'qty', 'refundAmount', 'restockable',
+          'alasan', 'tanggal', 'createdBy', 'createdByName', 'createdAt'
+        ])
+        && validStr(request.resource.data.soId, 500)
+        && validOptStr(request.resource.data, 'soNumber', 500)
+        && validStr(request.resource.data.productId, 500)
+        && validOptStr(request.resource.data, 'alasan', 500)
+        && validOptStr(request.resource.data, 'createdByName', 500)
+        && request.resource.data.qty is int && request.resource.data.qty > 0
+        && request.resource.data.refundAmount is int && request.resource.data.refundAmount >= 0
+        && request.resource.data.restockable is bool
+        && isPeriodOpen(request.resource.data.tanggal)
+        && validAuditMeta(request.resource.data);
+      allow update, delete: if false;
+    }
+
+    match /marketplace_channels/{id} {
+      allow read: if isOwnerOrAdmin();
+      allow create: if isOwnerOrAdmin()
+        && request.resource.data.keys().hasOnly(['nama', 'balance', 'active', 'createdBy', 'createdAt', 'updatedAt'])
+        && validStr(request.resource.data.nama, 100)
+        && request.resource.data.balance is int
+        && request.resource.data.active is bool
+        && validAuditMeta(request.resource.data);
+      allow update: if isOwnerOrAdmin()
+        && request.resource.data.keys().hasOnly(['nama', 'balance', 'active', 'createdBy', 'createdAt', 'updatedAt'])
+        && validStr(request.resource.data.nama, 100)
+        && request.resource.data.balance is int
+        && request.resource.data.active is bool
+        && request.resource.data.createdBy == resource.data.createdBy
+        && (!request.resource.data.keys().hasAny(['updatedAt']) || request.resource.data.updatedAt == request.time);
+      allow delete: if false;
+    }
+
+    match /marketplace_mappings/{id} {
+      allow read: if isOwnerOrAdmin();
+      allow create, update: if isOwnerOrAdmin()
+        && request.resource.data.keys().hasOnly(['channelId', 'channelName', 'mappingJson', 'updatedBy', 'updatedAt'])
+        && validStr(request.resource.data.channelId, 100)
+        && validStr(request.resource.data.channelName, 100)
+        && request.resource.data.mappingJson is string && request.resource.data.mappingJson.size() <= 4000
+        && request.resource.data.updatedBy == request.auth.uid
+        && request.resource.data.updatedAt == request.time;
+      allow delete: if false;
+    }
+
+    match /marketplace_payouts/{id} {
+      allow read: if isOwnerOrAdmin();
+      allow create: if isOwnerOrAdmin()
+        && request.resource.data.keys().hasOnly([
+          'channelId', 'channelName', 'accountId', 'accountName',
+          'amount', 'tanggal', 'catatan', 'createdBy', 'createdByName', 'createdAt'
+        ])
+        && validStr(request.resource.data.channelId, 500)
+        && validStr(request.resource.data.channelName, 100)
+        && validStr(request.resource.data.accountId, 500)
+        && validOptStr(request.resource.data, 'accountName', 500)
+        && validOptStr(request.resource.data, 'catatan', 500)
+        && validOptStr(request.resource.data, 'createdByName', 500)
+        && request.resource.data.amount is int && request.resource.data.amount > 0
+        && isPeriodOpen(request.resource.data.tanggal)
+        && validAuditMeta(request.resource.data);
+      allow update, delete: if false;
+    }
+
+    // --- 6. KOLEKSI KEUANGAN, BIAYA, UPAH MINGGUAN & PENGATURAN NERACA ---
+    match /purchase_costs/{id} {
+      allow read: if isOwnerOrAdmin();
+      allow create: if isOwnerOrAdmin()
+        && request.resource.data.keys().hasOnly([
+          'ledgerId', 'itemId', 'supplierId', 'qty', 'unitCost', 'totalCost',
+          'paidAmount', 'accountId', 'purchaseQty', 'purchaseUnit', 'actualUsageQty',
+          'tanggal', 'catatan', 'createdBy', 'createdByName', 'createdAt'
+        ])
+        && validStr(request.resource.data.ledgerId, 500)
+        && validStr(request.resource.data.itemId, 500)
+        && validOptStr(request.resource.data, 'supplierId', 500)
+        && validOptStr(request.resource.data, 'accountId', 500)
+        && validOptStr(request.resource.data, 'purchaseUnit', 100)
+        && validOptStr(request.resource.data, 'catatan', 500)
+        && validOptStr(request.resource.data, 'createdByName', 500)
+        && request.resource.data.qty is int && request.resource.data.qty > 0
+        // unitCost per cm/pcs boleh pecahan (number >= 0), totalCost tetap rupiah bulat
+        && request.resource.data.unitCost is number && request.resource.data.unitCost >= 0
+        && request.resource.data.totalCost is int && request.resource.data.totalCost >= 0
+        && (!request.resource.data.keys().hasAny(['purchaseQty']) || (request.resource.data.purchaseQty is number && request.resource.data.purchaseQty > 0))
+        && (!request.resource.data.keys().hasAny(['actualUsageQty']) || (request.resource.data.actualUsageQty is int && request.resource.data.actualUsageQty > 0))
+        && request.resource.data.paidAmount is int && request.resource.data.paidAmount >= 0
+        && request.resource.data.paidAmount <= request.resource.data.totalCost
+        && isPeriodOpen(request.resource.data.tanggal)
+        && validAuditMeta(request.resource.data);
+      allow update, delete: if false;
+    }
+
+    match /production_costs/{id} {
+      allow read: if isOwnerOrAdmin();
+      allow create: if isOwnerOrAdmin()
+        && request.resource.data.keys().hasOnly([
+          'woId', 'woNumber', 'vendorName', 'kategori', 'amount', 'paidAmount',
+          'accountId', 'tanggal', 'catatan', 'createdBy', 'createdByName', 'createdAt'
+        ])
+        && validStr(request.resource.data.woId, 500)
+        && validOptStr(request.resource.data, 'woNumber', 500)
+        && validOptStr(request.resource.data, 'vendorName', 500)
+        && validOptStr(request.resource.data, 'accountId', 500)
+        && validOptStr(request.resource.data, 'catatan', 500)
+        && validOptStr(request.resource.data, 'createdByName', 500)
+        && request.resource.data.kategori in ['jahit_cmt', 'cutting', 'finishing', 'sablon', 'packing', 'lainnya']
+        && request.resource.data.amount is int && request.resource.data.amount >= 0
+        && request.resource.data.paidAmount is int && request.resource.data.paidAmount >= 0
+        && request.resource.data.paidAmount <= request.resource.data.amount
+        && isPeriodOpen(request.resource.data.tanggal)
+        && validAuditMeta(request.resource.data);
+      allow update, delete: if false;
+    }
+
+    match /wage_payouts/{id} {
+      allow read: if isOwnerOrAdmin();
+      allow create: if isOwnerOrAdmin()
+        && request.resource.data.keys().hasOnly([
+          'startDate', 'endDate', 'tanggal', 'accountId', 'accountName',
+          'jahitCuttingStandard', 'sablonStandard', 'packingStandard', 'lainnyaStandard', 'totalStandard',
+          'jahitCuttingPaid', 'sablonPaid', 'packingPaid', 'lainnyaPaid', 'totalPaid', 'variance',
+          'catatan', 'createdBy', 'createdByName', 'createdAt'
+        ])
+        && isDateStr(request.resource.data.startDate)
+        && isDateStr(request.resource.data.endDate)
+        && validStr(request.resource.data.accountId, 500)
+        && validOptStr(request.resource.data, 'accountName', 500)
+        && validOptStr(request.resource.data, 'catatan', 500)
+        && validOptStr(request.resource.data, 'createdByName', 500)
+        && request.resource.data.jahitCuttingStandard is int && request.resource.data.jahitCuttingStandard >= 0
+        && request.resource.data.sablonStandard is int && request.resource.data.sablonStandard >= 0
+        && request.resource.data.packingStandard is int && request.resource.data.packingStandard >= 0
+        && request.resource.data.lainnyaStandard is int && request.resource.data.lainnyaStandard >= 0
+        && request.resource.data.totalStandard is int && request.resource.data.totalStandard >= 0
+        && request.resource.data.jahitCuttingPaid is int && request.resource.data.jahitCuttingPaid >= 0
+        && request.resource.data.sablonPaid is int && request.resource.data.sablonPaid >= 0
+        && request.resource.data.packingPaid is int && request.resource.data.packingPaid >= 0
+        && request.resource.data.lainnyaPaid is int && request.resource.data.lainnyaPaid >= 0
+        && request.resource.data.totalPaid is int && request.resource.data.totalPaid >= 0
+        && request.resource.data.variance is int
+        && request.resource.data.variance == request.resource.data.totalPaid - request.resource.data.totalStandard
+        && isPeriodOpen(request.resource.data.tanggal)
+        && validAuditMeta(request.resource.data);
+      allow update, delete: if false;
+    }
+
+    match /operating_expenses/{id} {
+      allow read: if isOwnerOrAdmin();
+      allow create: if isOwnerOrAdmin()
+        && request.resource.data.keys().hasOnly([
+          'kategori', 'deskripsi', 'accountId', 'amount', 'tanggal',
+          'createdBy', 'createdByName', 'createdAt'
+        ])
+        && validStr(request.resource.data.kategori, 500)
+        && validOptStr(request.resource.data, 'deskripsi', 500)
+        && validStr(request.resource.data.accountId, 500)
+        && validOptStr(request.resource.data, 'createdByName', 500)
+        && request.resource.data.amount is int && request.resource.data.amount > 0
+        && isPeriodOpen(request.resource.data.tanggal)
+        && validAuditMeta(request.resource.data);
+      allow update, delete: if false;
+    }
+
+    match /journal_entries/{id} {
+      allow read: if isOwnerOrAdmin();
+      allow create: if isOwnerOrAdmin()
+        && request.resource.data.keys().hasOnly([
+          'tanggal', 'source', 'refId', 'accountId', 'debitAccount', 'creditAccount',
+          'amount', 'debitAmount', 'creditAmount', 'deskripsi', 'isReversal',
+          'reversedEntryId', 'createdBy', 'createdByName', 'createdAt'
+        ])
+        && request.resource.data.amount is int && request.resource.data.amount >= 0
+        && validStr(request.resource.data.source, 500)
+        && validOptStr(request.resource.data, 'refId', 500)
+        && validOptStr(request.resource.data, 'accountId', 500)
+        && validStr(request.resource.data.debitAccount, 500)
+        && validStr(request.resource.data.creditAccount, 500)
+        && validOptStr(request.resource.data, 'deskripsi', 500)
+        && validOptStr(request.resource.data, 'reversedEntryId', 500)
+        && validOptStr(request.resource.data, 'createdByName', 500)
+        && (!request.resource.data.keys().hasAny(['isReversal']) || request.resource.data.isReversal is bool)
+        && request.resource.data.debitAccount != request.resource.data.creditAccount
+        && (!request.resource.data.keys().hasAny(['debitAmount', 'creditAmount'])
+            || (request.resource.data.debitAmount is int
+                && request.resource.data.creditAmount is int
+                && request.resource.data.debitAmount == request.resource.data.creditAmount
+                && request.resource.data.debitAmount == request.resource.data.amount))
+        && isPeriodOpen(request.resource.data.tanggal)
+        && validAuditMeta(request.resource.data);
+      allow update, delete: if false;
+    }
+
+    match /accounting_settings/{id} {
+      allow read: if isOwnerOrAdmin();
+      allow create, update: if isOwnerOrAdmin()
+        && request.resource.data.keys().hasOnly(['modalAwal', 'updatedBy', 'updatedAt'])
+        && (!request.resource.data.keys().hasAny(['modalAwal']) || request.resource.data.modalAwal == null || (request.resource.data.modalAwal is int && request.resource.data.modalAwal >= 0))
+        && request.resource.data.updatedBy == request.auth.uid
+        && request.resource.data.updatedAt == request.time;
+      allow delete: if false;
+    }
+
+    // --- 7. PERIODE (Reopen closed->open STRICTLY OWNER-ONLY + audit_logs), REKONSILIASI BANK & AUDIT LOGS ---
+    function isOwnerAuditedPeriodReopen(periodId) {
+      return request.resource.data.keys().hasAny(['lastAuditLogId'])
+        && validStr(request.resource.data.lastAuditLogId, 500)
+        && !exists(/databases/$(database)/documents/audit_logs/$(request.resource.data.lastAuditLogId))
+        && existsAfter(/databases/$(database)/documents/audit_logs/$(request.resource.data.lastAuditLogId))
+        && getAfter(/databases/$(database)/documents/audit_logs/$(request.resource.data.lastAuditLogId)).data.uid == request.auth.uid
+        && getAfter(/databases/$(database)/documents/audit_logs/$(request.resource.data.lastAuditLogId)).data.createdBy == request.auth.uid
+        && getAfter(/databases/$(database)/documents/audit_logs/$(request.resource.data.lastAuditLogId)).data.targetCollection == 'periods'
+        && getAfter(/databases/$(database)/documents/audit_logs/$(request.resource.data.lastAuditLogId)).data.targetId == periodId
+        && getAfter(/databases/$(database)/documents/audit_logs/$(request.resource.data.lastAuditLogId)).data.createdAt == request.time;
+    }
+
+    match /periods/{periodId} {
+      allow read: if isOwnerOrAdmin();
+      allow create: if isPeriodId(periodId)
+        && request.resource.data.keys().hasOnly(['closed', 'closedNote', 'updatedBy', 'updatedAt', 'lastAuditLogId'])
+        && request.resource.data.closed is bool
+        && validOptStr(request.resource.data, 'closedNote', 500)
+        && request.resource.data.updatedBy == request.auth.uid
+        && request.resource.data.updatedAt == request.time
+        && (
+          (request.resource.data.closed == true && isOwnerOrAdmin())
+          || (request.resource.data.closed == false && isOwner() && isOwnerAuditedPeriodReopen(periodId))
+        );
+      allow update: if isPeriodId(periodId)
+        && request.resource.data.keys().hasOnly(['closed', 'closedNote', 'updatedBy', 'updatedAt', 'lastAuditLogId'])
+        && request.resource.data.closed is bool
+        && validOptStr(request.resource.data, 'closedNote', 500)
+        && request.resource.data.updatedBy == request.auth.uid
+        && request.resource.data.updatedAt == request.time
+        && (
+          (resource.data.closed == true && request.resource.data.closed == false && isOwner() && isOwnerAuditedPeriodReopen(periodId))
+          || (!(resource.data.closed == true && request.resource.data.closed == false) && isOwnerOrAdmin())
+        );
+      allow delete: if false;
+    }
+
+    function validBankStatementShape(data) {
+      return data.keys().hasOnly([
+          'accountId', 'tanggal', 'deskripsi', 'amount', 'matchedRefId', 'matchedNote',
+          'createdBy', 'createdAt'
+        ])
+        && validStr(data.accountId, 500)
+        && isDateStr(data.tanggal)
+        && validOptStr(data, 'deskripsi', 500)
+        && data.amount is int
+        && validOptStr(data, 'matchedRefId', 500)
+        && validOptStr(data, 'matchedNote', 500);
+    }
+
+    match /bank_statements/{id} {
+      allow read: if isOwnerOrAdmin();
+      allow create: if isOwnerOrAdmin()
+        && validBankStatementShape(request.resource.data)
+        && validAuditMeta(request.resource.data);
+      allow update: if isOwnerOrAdmin()
+        && validBankStatementShape(request.resource.data)
+        && request.resource.data.createdBy == resource.data.createdBy;
+      allow delete: if false;
+    }
+
+    match /audit_logs/{id} {
+      allow read: if isOwnerOrAdmin();
+      allow create: if isOwnerOrAdmin()
+        && request.resource.data.keys().hasOnly([
+          'uid', 'createdBy', 'createdByName', 'aksi', 'targetCollection',
+          'targetId', 'sebelum', 'sesudah', 'createdAt'
+        ])
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.createdBy == request.auth.uid
+        && validStr(request.resource.data.aksi, 100)
+        && validOptStr(request.resource.data, 'createdByName', 500)
+        && validOptStr(request.resource.data, 'targetCollection', 500)
+        && validOptStr(request.resource.data, 'targetId', 500)
+        && validOptStr(request.resource.data, 'sebelum', 500)
+        && validOptStr(request.resource.data, 'sesudah', 500)
+        && request.resource.data.createdAt == request.time;
+      allow update, delete: if false;
+    }
+  }
+}
